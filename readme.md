@@ -104,7 +104,7 @@
 示例：
 
 ```json
-"default_user_id": 2039089
+"default_user_id": 1234567
 ```
 
 ---
@@ -141,7 +141,7 @@ true  = 下载带视频版本，文件更大
 推荐：
 
 ```json
-"with_video": false
+"with_video": true
 ```
 
 ---
@@ -254,7 +254,7 @@ Sayo 下载失败后，是否尝试从 osu! 官网下载。
 {
   "client_id": "你的_client_id",
   "client_secret": "你的_client_secret",
-  "default_user_id": 2039089,
+  "default_user_id": "",
   "download_dir": "osu_maps",
   "with_video": false,
   "types": ["ranked", "loved", "pending", "graveyard"],
@@ -333,15 +333,15 @@ mapper_id,mapper_name
 
 ```csv
 mapper_id,mapper_name
-5485069,JDS20
-8570499,shiyu
-2039089,
+id_1,mapper_1
+id_2,mapper_2
+id_3,
 ```
 
 说明：
 
 - `mapper_id` 必填
-- `mapper_name` 可以留空
+- `mapper_name` 可以留空,程序会自动补充
 
 ---
 
