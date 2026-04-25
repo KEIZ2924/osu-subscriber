@@ -951,7 +951,7 @@ class OsuDownloaderGUI:
         main_frame = ttk.Frame(self.root, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        input_frame = ttk.LabelFrame(main_frame, text="MapperId", padding=10)
+        input_frame = ttk.LabelFrame(main_frame, text="Mapper_id", padding=10)
         input_frame.pack(fill=tk.X)
 
         ttk.Label(input_frame, text="Mapper ID:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
@@ -960,7 +960,7 @@ class OsuDownloaderGUI:
         self.mapper_entry = ttk.Entry(input_frame, textvariable=self.mapper_id_var, width=30)
         self.mapper_entry.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
 
-        ttk.Label(input_frame, text="Mappers CSV:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(input_frame, text="Mappers csv:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
 
         self.batch_file_var = tk.StringVar(value="")
         self.batch_file_entry = ttk.Entry(input_frame, textvariable=self.batch_file_var, width=70)
