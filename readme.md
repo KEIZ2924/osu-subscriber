@@ -1,4 +1,4 @@
-# osu! Mapper Beatmap Downloader 
+# osu! Subscriber
 
 本工具用于根据 osu! Mapper ID 批量下载谱面。
 
