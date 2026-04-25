@@ -1,0 +1,13 @@
+{
+  "client_id": "",
+  "client_secret": "",
+  "default_user_id": "",
+  "download_dir": "osu_maps",
+  "with_video": true,
+  "types": ["ranked", "loved", "pending", "graveyard"],
+  "cookies_file": "cookies.txt",
+
+  "prefer_sayo": true,
+  "sayo_base_url": "https://txy1.sayobot.cn",
+  "fallback_to_osu": true
+}
