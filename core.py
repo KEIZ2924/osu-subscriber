@@ -1,40 +1,29 @@
-import json
 import csv
 import re
 import time
+import json
 import pathlib
 import threading
-import queue
 import requests
-import tkinter as tk
 
-from tkinter import ttk, filedialog, messagebox
+from datetime import datetime, timezone
 from urllib.parse import unquote
 from http.cookiejar import MozillaCookieJar
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-
-CONFIG_FILE = "config.json"
-
-API_BASE = "https://osu.ppy.sh/api/v2"
-TOKEN_URL = "https://osu.ppy.sh/oauth/token"
-
-VALID_TYPES = [
-    "favourite",
-    "ranked",
-    "loved",
-    "pending",
-    "graveyard",
-]
+from constants import API_BASE, TOKEN_URL, DOWNLOAD_INFO_FILE
 
 
 class OsuDownloaderCore:
     def __init__(self, config, log_func, progress_func, speed_func, stop_event):
-        self.config = config
-        self.log = log_func
-        self.update_progress = progress_func
-        self.update_speed = speed_func
-        self.stop_event = stop_event
+            self.config = config
+            self.log = log_func
+            self.update_progress = progress_func
+            self.update_speed = speed_func
+            self.stop_event = stop_event
+
+            self.info_file_path = pathlib.Path(DOWNLOAD_INFO_FILE)
+            self.info_lock = threading.Lock()
 
     def get_access_token(self):
         self.log("正在获取 osu! API Access Token...")
@@ -82,9 +71,6 @@ class OsuDownloaderCore:
         raise RuntimeError("任务已停止")
 
     def fetch_user_info(self, session, user_id):
-        """
-        获取 Mapper 用户信息。
-        """
         self.log(f"正在获取用户信息: {user_id}")
 
         data = self.api_get(
@@ -101,19 +87,6 @@ class OsuDownloaderCore:
         }
 
     def update_mapper_csv(self, csv_path, mapper_id, mapper_name):
-        """
-        更新 Mapper CSV。
-
-        CSV 格式：
-        mapper_id,mapper_name
-
-        规则：
-        1. 每个 mapper_id 只保留一行。
-        2. mapper_name 保存该 ID 的历史名字列表。
-        3. 如果 API 返回的新名字已存在，不重复添加。
-        4. 如果 API 返回的新名字不存在，追加到 mapper_name 字段。
-        5. 如果 mapper_id 不存在，新增一行。
-        """
         if not csv_path:
             return
 
@@ -330,12 +303,240 @@ class OsuDownloaderCore:
         name = re.sub(r'[\\/:*?"<>|]', "_", str(name))
         name = name.strip()
         return name[:180]
+    
+    @staticmethod
+    def parse_osu_datetime(value):
+        """
+        osu! API 常见时间格式：
+        2026-02-15T12:34:56+00:00
+        2026-02-15T12:34:56Z
+        """
+        if not value:
+            return None
+
+        try:
+            value = str(value).strip()
+
+            if value.endswith("Z"):
+                value = value[:-1] + "+00:00"
+
+            dt = datetime.fromisoformat(value)
+
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+
+            return dt.astimezone(timezone.utc)
+
+        except Exception:
+            return None
+
+    @staticmethod
+    def now_utc_iso():
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    def build_official_url(self, beatmapset_id):
+        return f"https://osu.ppy.sh/beatmapsets/{beatmapset_id}"
+
+    def load_all_download_info_unlocked(self):
+        """
+        注意：调用这个方法前应当已经持有 self.info_lock。
+        """
+        if not self.info_file_path.exists():
+            return {
+                "version": 1,
+                "beatmapsets": {}
+            }
+
+        try:
+            with open(self.info_file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if not isinstance(data, dict):
+                return {
+                    "version": 1,
+                    "beatmapsets": {}
+                }
+
+            if "beatmapsets" not in data or not isinstance(data["beatmapsets"], dict):
+                data["beatmapsets"] = {}
+
+            if "version" not in data:
+                data["version"] = 1
+
+            return data
+
+        except Exception as e:
+            self.log(f"读取统一信息 JSON 失败: {self.info_file_path}")
+            self.log(str(e))
+
+            return {
+                "version": 1,
+                "beatmapsets": {}
+            }
+
+    def save_all_download_info_unlocked(self, data):
+        """
+        注意：调用这个方法前应当已经持有 self.info_lock。
+        使用临时文件写入，避免中途失败导致 JSON 损坏。
+        """
+        temp_path = self.info_file_path.with_suffix(".json.tmp")
+
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            temp_path.replace(self.info_file_path)
+
+        except Exception as e:
+            self.log(f"写入统一信息 JSON 失败: {self.info_file_path}")
+            self.log(str(e))
+
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception:
+                pass
+
+    def get_download_info(self, beatmapset_id):
+        beatmapset_id = str(beatmapset_id)
+
+        with self.info_lock:
+            data = self.load_all_download_info_unlocked()
+            return data.get("beatmapsets", {}).get(beatmapset_id)
+
+    def save_download_info(
+        self,
+        beatmapset,
+        filename,
+        file_path,
+        used_source,
+        used_url,
+        downloaded_at,
+        with_video=None,
+    ):
+        beatmapset_id = beatmapset.get("id")
+
+        if beatmapset_id is None:
+            return
+
+        beatmapset_id_str = str(beatmapset_id)
+
+        submitted_date = beatmapset.get("submitted_date")
+        last_updated = beatmapset.get("last_updated")
+
+        artist = beatmapset.get("artist", "")
+        title = beatmapset.get("title", "")
+        creator = beatmapset.get("creator", "")
+        user_id = beatmapset.get("user_id", "")
+
+        info = {
+            "beatmapset_id": beatmapset_id,
+            "official_url": self.build_official_url(beatmapset_id),
+
+            "song": {
+                "artist": artist,
+                "title": title,
+                "artist_unicode": beatmapset.get("artist_unicode", ""),
+                "title_unicode": beatmapset.get("title_unicode", ""),
+                "source": beatmapset.get("source", ""),
+                "tags": beatmapset.get("tags", ""),
+            },
+
+            "mapper": {
+                "user_id": user_id,
+                "username": creator,
+            },
+
+            "time": {
+                "submitted_date": submitted_date,
+                "last_updated": last_updated,
+                "downloaded_at": downloaded_at,
+            },
+
+            "download": {
+                "filename": filename,
+                "file_path": str(file_path),
+                "source": used_source,
+                "url": used_url,
+                "with_video": with_video,
+            }
+        }
+
+        with self.info_lock:
+            data = self.load_all_download_info_unlocked()
+
+            data.setdefault("version", 1)
+            data.setdefault("beatmapsets", {})
+
+            data["beatmapsets"][beatmapset_id_str] = info
+
+            self.save_all_download_info_unlocked(data)
+
+        self.log(f"谱面信息已写入统一 JSON: {self.info_file_path} | {beatmapset_id}")
+
+    def find_existing_osz(self, download_dir, beatmapset_id):
+        files = list(download_dir.glob(f"{beatmapset_id} *.osz"))
+
+        if files:
+            return files[0]
+
+        return None
+
+    def should_redownload_existing_file(self, beatmapset, existing_path):
+        """
+        返回：
+        True  = 需要重新下载
+        False = 可以跳过
+        """
+        beatmapset_id = beatmapset.get("id")
+        api_last_updated_raw = beatmapset.get("last_updated")
+
+        api_last_updated = self.parse_osu_datetime(api_last_updated_raw)
+
+        if api_last_updated is None:
+            self.log(f"谱面 {beatmapset_id} 没有有效更新时间，跳过已存在文件")
+            return False
+
+        info = self.get_download_info(beatmapset_id)
+
+        downloaded_at = None
+
+        if info:
+            downloaded_at_raw = (
+                info.get("time", {}).get("downloaded_at")
+                or info.get("downloaded_at")
+            )
+            downloaded_at = self.parse_osu_datetime(downloaded_at_raw)
+
+        if downloaded_at is None:
+            try:
+                mtime = existing_path.stat().st_mtime
+                downloaded_at = datetime.fromtimestamp(mtime, timezone.utc)
+                self.log(
+                    f"谱面 {beatmapset_id} 没有统一 JSON 下载记录，使用文件修改时间判断"
+                )
+            except Exception:
+                self.log(f"谱面 {beatmapset_id} 无法判断本地下载时间，将重新下载")
+                return True
+
+        if downloaded_at < api_last_updated:
+            self.log(
+                f"谱面 {beatmapset_id} 已更新，需要重新下载: "
+                f"本地下载时间={downloaded_at.isoformat(timespec='seconds')}，"
+                f"官网更新时间={api_last_updated.isoformat(timespec='seconds')}"
+            )
+            return True
+
+        self.log(
+            f"跳过已存在且未更新: {beatmapset_id}，"
+            f"本地下载时间={downloaded_at.isoformat(timespec='seconds')}，"
+            f"官网更新时间={api_last_updated.isoformat(timespec='seconds')}"
+        )
+
+        return False
+
 
     def build_api_filename(self, beatmapset):
-        """
-        对齐 osu! 官网命名：
-        2444352 BABYMETAL - Road of Resistance.osz
-        """
         beatmapset_id = beatmapset["id"]
         artist = beatmapset.get("artist", "unknown")
         title = beatmapset.get("title", "unknown")
@@ -344,19 +545,6 @@ class OsuDownloaderCore:
         return self.safe_filename(filename)
 
     def build_user_download_dir(self, output_dir, user_id, username):
-        """
-        创建 Mapper 保存目录。
-
-        目标格式：
-        osu_maps/{user_id} [{username}]
-
-        例如：
-        osu_maps/8570499 [shiyu]
-
-        如果已经存在同 ID 开头的目录：
-        1. 如果是旧格式会尝试重命名
-        2. 如果已经是新格式直接复用
-        """
         base_dir = pathlib.Path(output_dir)
         base_dir.mkdir(parents=True, exist_ok=True)
 
@@ -366,11 +554,9 @@ class OsuDownloaderCore:
         new_folder_name = self.safe_filename(f"{user_id} [{safe_username}]")
         new_user_dir = base_dir / new_folder_name
 
-        # 如果新格式目录已经存在，直接使用
         if new_user_dir.exists() and new_user_dir.is_dir():
             return new_user_dir
 
-        # 查找同 ID 的旧目录或其他格式目录
         existing_same_id_dirs = []
 
         for item in base_dir.iterdir():
@@ -384,7 +570,6 @@ class OsuDownloaderCore:
             ):
                 existing_same_id_dirs.append(item)
 
-        # 如果找到同 ID 目录，优先尝试迁移成新目录名
         if existing_same_id_dirs:
             old_dir = existing_same_id_dirs[0]
 
@@ -400,11 +585,9 @@ class OsuDownloaderCore:
                 self.log(str(e))
                 return old_dir
 
-        # 没有任何同 ID 目录，则创建新格式目录
         new_user_dir.mkdir(parents=True, exist_ok=True)
 
         return new_user_dir
-
 
     def build_download_urls(self, beatmapset_id, with_video=False):
         prefer_sayo = bool(self.config.get("prefer_sayo", True))
@@ -551,11 +734,36 @@ class OsuDownloaderCore:
 
             fallback_name = self.build_api_filename(beatmapset)
 
-            existing_files = list(download_dir.glob(f"{beatmapset_id} *.osz"))
-            if existing_files:
-                self.log(f"跳过已存在: {beatmapset_id}")
-                self.update_progress(100, 0, "已存在，跳过")
-                return True
+            existing_path = self.find_existing_osz(download_dir, beatmapset_id)
+            force_redownload = False
+
+            if existing_path:
+                if self.should_redownload_existing_file(beatmapset, existing_path):
+                    force_redownload = True
+                    self.log(f"准备重新下载已更新谱面: {existing_path}")
+                else:
+                    self.update_progress(100, 0, "已存在且未更新，跳过")
+
+                    existing_info = self.get_download_info(beatmapset_id)
+
+                    if not existing_info:
+                        downloaded_at = datetime.fromtimestamp(
+                            existing_path.stat().st_mtime,
+                            timezone.utc
+                        ).isoformat(timespec="seconds")
+
+                        self.save_download_info(
+                            beatmapset=beatmapset,
+                            filename=existing_path.name,
+                            file_path=existing_path,
+                            used_source="existing",
+                            used_url="",
+                            downloaded_at=downloaded_at,
+                            with_video=with_video,
+                        )
+
+                    return True
+
 
             download_urls = self.build_download_urls(beatmapset_id, with_video)
 
@@ -653,7 +861,7 @@ class OsuDownloaderCore:
             filename = self.safe_filename(filename)
             path = download_dir / filename
 
-            if path.exists():
+            if path.exists() and not force_redownload:
                 self.log(f"跳过已存在: {path}")
                 self.update_progress(100, 0, "已存在，跳过")
                 try:
@@ -661,6 +869,7 @@ class OsuDownloaderCore:
                 except Exception:
                     pass
                 return True
+
 
             temp_path = download_dir / f"{filename}.part"
 
@@ -709,7 +918,8 @@ class OsuDownloaderCore:
 
                                 self.update_speed(speed)
 
-                temp_path.rename(path)
+                temp_path.replace(path)
+
 
             except Exception as e:
                 self.log(f"保存文件失败或下载中止: {path}")
@@ -722,6 +932,18 @@ class OsuDownloaderCore:
                         pass
 
                 return False
+
+            downloaded_at = self.now_utc_iso()
+
+            self.save_download_info(
+                beatmapset=beatmapset,
+                filename=filename,
+                file_path=path,
+                used_source=used_source,
+                used_url=used_url,
+                downloaded_at=downloaded_at,
+                with_video=with_video,
+            )
 
             self.update_progress(100, downloaded, f"{used_source} | 完成")
             self.update_speed(0)
@@ -891,476 +1113,3 @@ class OsuDownloaderCore:
         else:
             self.log("")
             self.log("全部任务完成。")
-
-
-class OsuDownloaderGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("osu! Subscriber")
-        self.root.geometry("1050x780")
-
-        self.log_queue = queue.Queue()
-        self.progress_queue = queue.Queue()
-        self.speed_queue = queue.Queue()
-
-        self.worker_thread = None
-        self.stop_event = threading.Event()
-
-        self.config = self.load_config()
-
-        self.create_widgets()
-        self.root.after(100, self.process_queues)
-
-    def load_config(self):
-        config_path = pathlib.Path(CONFIG_FILE)
-
-        if not config_path.exists():
-            messagebox.showerror(
-                "错误",
-                f"找不到配置文件 {CONFIG_FILE}，请先创建 config.json"
-            )
-            raise FileNotFoundError(CONFIG_FILE)
-
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-
-        required_keys = [
-            "client_id",
-            "client_secret",
-            "default_user_id",
-            "download_dir",
-            "with_video",
-            "types",
-        ]
-
-        for key in required_keys:
-            if key not in config:
-                messagebox.showerror("错误", f"config.json 缺少字段: {key}")
-                raise RuntimeError(f"config.json 缺少字段: {key}")
-
-        config.setdefault("cookies_file", "cookies.txt")
-        config.setdefault("prefer_sayo", True)
-        config.setdefault("sayo_base_url", "https://txy1.sayobot.cn")
-        config.setdefault("fallback_to_osu", True)
-        config.setdefault("max_workers", 3)
-        config.setdefault("use_api_filename", True)
-
-        return config
-
-    def create_widgets(self):
-        main_frame = ttk.Frame(self.root, padding=10)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-
-        input_frame = ttk.LabelFrame(main_frame, text="Mapper_id", padding=10)
-        input_frame.pack(fill=tk.X)
-
-        ttk.Label(input_frame, text="Mapper ID:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
-
-        self.mapper_id_var = tk.StringVar(value=str(self.config.get("default_user_id", "")))
-        self.mapper_entry = ttk.Entry(input_frame, textvariable=self.mapper_id_var, width=30)
-        self.mapper_entry.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
-
-        ttk.Label(input_frame, text="Mappers csv:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
-
-        self.batch_file_var = tk.StringVar(value="")
-        self.batch_file_entry = ttk.Entry(input_frame, textvariable=self.batch_file_var, width=70)
-        self.batch_file_entry.grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
-
-        self.select_file_button = ttk.Button(input_frame, text="选择 CSV", command=self.select_batch_file)
-        self.select_file_button.grid(row=1, column=2, padx=5, pady=5)
-
-        ttk.Label(input_frame, text="osz保存目录:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
-
-        self.output_dir_var = tk.StringVar(value=self.config.get("download_dir", "osu_maps"))
-        self.output_dir_entry = ttk.Entry(input_frame, textvariable=self.output_dir_var, width=70)
-        self.output_dir_entry.grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
-
-        self.select_output_button = ttk.Button(input_frame, text="选择目录", command=self.select_output_dir)
-        self.select_output_button.grid(row=2, column=2, padx=5, pady=5)
-
-        option_frame = ttk.LabelFrame(main_frame, text="下载选项", padding=10)
-        option_frame.pack(fill=tk.X, pady=10)
-
-        self.with_video_var = tk.BooleanVar(value=bool(self.config.get("with_video", False)))
-        self.with_video_check = ttk.Checkbutton(
-            option_frame,
-            text="下载带视频版本",
-            variable=self.with_video_var
-        )
-        self.with_video_check.grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
-
-        self.prefer_sayo_var = tk.BooleanVar(value=bool(self.config.get("prefer_sayo", True)))
-        self.prefer_sayo_check = ttk.Checkbutton(
-            option_frame,
-            text="优先使用Sayo镜像",
-            variable=self.prefer_sayo_var
-        )
-        self.prefer_sayo_check.grid(row=0, column=1, sticky=tk.W, padx=10, pady=5)
-
-        self.fallback_to_osu_var = tk.BooleanVar(value=bool(self.config.get("fallback_to_osu", True)))
-        self.fallback_to_osu_check = ttk.Checkbutton(
-            option_frame,
-            text="失败后使用 osu! 官网",
-            variable=self.fallback_to_osu_var
-        )
-        self.fallback_to_osu_check.grid(row=0, column=2, sticky=tk.W, padx=10, pady=5)
-
-        self.use_api_filename_var = tk.BooleanVar(value=bool(self.config.get("use_api_filename", True)))
-        self.use_api_filename_check = ttk.Checkbutton(
-            option_frame,
-            text="统一文件名（建议开启）",
-            variable=self.use_api_filename_var
-        )
-        self.use_api_filename_check.grid(row=0, column=3, sticky=tk.W, padx=10, pady=5)
-
-        ttk.Label(option_frame, text="Sayo 地址:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
-
-        self.sayo_base_url_var = tk.StringVar(
-            value=self.config.get("sayo_base_url", "https://txy1.sayobot.cn")
-        )
-        self.sayo_base_url_entry = ttk.Entry(
-            option_frame,
-            textvariable=self.sayo_base_url_var,
-            width=50
-        )
-        self.sayo_base_url_entry.grid(row=1, column=1, columnspan=3, sticky=tk.W, padx=5, pady=5)
-
-        ttk.Label(option_frame, text="并行线程数:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
-
-        self.max_workers_var = tk.IntVar(value=int(self.config.get("max_workers", 3)))
-        self.max_workers_spinbox = tk.Spinbox(
-            option_frame,
-            from_=1,
-            to=8,
-            textvariable=self.max_workers_var,
-            width=6
-        )
-        self.max_workers_spinbox.grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
-
-        ttk.Label(
-            option_frame,
-            text="建议2-4避免触发限速"
-        ).grid(row=2, column=2, columnspan=2, sticky=tk.W, padx=5, pady=5)
-
-        type_frame = ttk.LabelFrame(main_frame, text="谱面类型", padding=10)
-        type_frame.pack(fill=tk.X)
-
-        self.type_vars = {}
-        default_types = set(self.config.get("types", ["ranked", "loved", "pending", "graveyard"]))
-
-        for i, map_type in enumerate(VALID_TYPES):
-            var = tk.BooleanVar(value=map_type in default_types)
-            self.type_vars[map_type] = var
-
-            check = ttk.Checkbutton(
-                type_frame,
-                text=map_type,
-                variable=var
-            )
-            check.grid(row=0, column=i, sticky=tk.W, padx=12, pady=5)
-
-        progress_frame = ttk.LabelFrame(main_frame, text="进度", padding=10)
-        progress_frame.pack(fill=tk.X, pady=10)
-
-        ttk.Label(progress_frame, text="进度:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
-
-        self.file_progress_var = tk.DoubleVar(value=0)
-        self.file_progress_bar = ttk.Progressbar(
-            progress_frame,
-            variable=self.file_progress_var,
-            maximum=100,
-            length=700
-        )
-        self.file_progress_bar.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
-
-        self.file_progress_label_var = tk.StringVar(value="0%")
-        self.file_progress_label = ttk.Label(progress_frame, textvariable=self.file_progress_label_var)
-        self.file_progress_label.grid(row=0, column=2, sticky=tk.W, padx=5, pady=5)
-
-        ttk.Label(progress_frame, text="下载速度:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
-
-        self.speed_label_var = tk.StringVar(value="0 KB/s")
-        self.speed_label = ttk.Label(progress_frame, textvariable=self.speed_label_var)
-        self.speed_label.grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
-
-        ttk.Label(progress_frame, text="状态:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
-
-        self.status_label_var = tk.StringVar(value="等待开始")
-        self.status_label = ttk.Label(progress_frame, textvariable=self.status_label_var)
-        self.status_label.grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
-
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill=tk.X, pady=10)
-
-        self.start_button = ttk.Button(button_frame, text="开始下载", command=self.start_download)
-        self.start_button.pack(side=tk.LEFT, padx=5)
-
-        self.stop_button = ttk.Button(button_frame, text="停止", command=self.stop_download, state=tk.DISABLED)
-        self.stop_button.pack(side=tk.LEFT, padx=5)
-
-        self.clear_log_button = ttk.Button(button_frame, text="清空日志", command=self.clear_log)
-        self.clear_log_button.pack(side=tk.LEFT, padx=5)
-
-        log_frame = ttk.LabelFrame(main_frame, text="日志输出", padding=10)
-        log_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.log_text = tk.Text(log_frame, wrap=tk.WORD, height=20)
-        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        self.log_text.configure(yscrollcommand=scrollbar.set)
-
-    def select_batch_file(self):
-        file_path = filedialog.askopenfilename(
-            title="选择批量 Mapper CSV 文件",
-            filetypes=[
-                ("CSV files", "*.csv"),
-                ("All files", "*.*"),
-            ],
-        )
-
-        if file_path:
-            self.batch_file_var.set(file_path)
-
-    def select_output_dir(self):
-        dir_path = filedialog.askdirectory(title="选择保存目录")
-
-        if dir_path:
-            self.output_dir_var.set(dir_path)
-
-    def parse_user_ids(self):
-        ids = []
-
-        single_id = self.mapper_id_var.get().strip()
-
-        if single_id:
-            if single_id.isdigit():
-                ids.append(int(single_id))
-            else:
-                raise ValueError("单个 Mapper ID 必须是数字")
-
-        csv_file = self.batch_file_var.get().strip()
-
-        if csv_file:
-            path = pathlib.Path(csv_file)
-
-            if not path.exists():
-                raise FileNotFoundError(f"Mapper CSV 文件不存在: {csv_file}")
-
-            with open(path, "r", encoding="utf-8-sig", newline="") as f:
-                reader = csv.DictReader(f)
-
-                if not reader.fieldnames:
-                    raise ValueError("CSV 文件为空或没有表头")
-
-                if "mapper_id" not in reader.fieldnames:
-                    raise ValueError("CSV 文件必须包含 mapper_id 字段")
-
-                for row in reader:
-                    mapper_id = str(row.get("mapper_id", "")).strip()
-
-                    if not mapper_id:
-                        continue
-
-                    if not mapper_id.isdigit():
-                        raise ValueError(f"CSV 中存在非法 mapper_id: {mapper_id}")
-
-                    ids.append(int(mapper_id))
-
-        ids = list(dict.fromkeys(ids))
-
-        if not ids:
-            raise ValueError("请至少输入一个 Mapper ID 或选择 Mapper CSV 文件")
-
-        return ids
-
-    def get_selected_types(self):
-        selected = [
-            map_type
-            for map_type, var in self.type_vars.items()
-            if var.get()
-        ]
-
-        if not selected:
-            raise ValueError("请至少选择一种谱面类型")
-
-        return selected
-
-    def start_download(self):
-        if self.worker_thread and self.worker_thread.is_alive():
-            messagebox.showwarning("提示", "任务已经在运行中")
-            return
-
-        try:
-            user_ids = self.parse_user_ids()
-            selected_types = self.get_selected_types()
-        except Exception as e:
-            messagebox.showerror("输入错误", str(e))
-            return
-
-        output_dir = self.output_dir_var.get().strip()
-        mapper_csv_path = self.batch_file_var.get().strip() or None
-
-        if not output_dir:
-            messagebox.showerror("输入错误", "保存目录不能为空")
-            return
-
-        pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-        with_video = self.with_video_var.get()
-
-        self.config["prefer_sayo"] = self.prefer_sayo_var.get()
-        self.config["fallback_to_osu"] = self.fallback_to_osu_var.get()
-        self.config["use_api_filename"] = self.use_api_filename_var.get()
-        self.config["sayo_base_url"] = (
-            self.sayo_base_url_var.get().strip()
-            or "https://txy1.sayobot.cn"
-        )
-
-        try:
-            max_workers = int(self.max_workers_var.get())
-        except Exception:
-            max_workers = 3
-
-        max_workers = max(1, min(max_workers, 8))
-        self.config["max_workers"] = max_workers
-
-        self.stop_event.clear()
-
-        self.start_button.config(state=tk.DISABLED)
-        self.stop_button.config(state=tk.NORMAL)
-
-        self.log_message("准备开始下载任务")
-        self.log_message(f"Mapper ID 列表: {user_ids}")
-        self.log_message(f"谱面类型: {selected_types}")
-        self.log_message(f"保存目录: {output_dir}")
-        self.log_message(f"Mapper CSV: {mapper_csv_path or '未使用'}")
-        self.log_message(f"下载视频: {'是' if with_video else '否'}")
-        self.log_message(f"优先使用 Sayo: {'是' if self.config['prefer_sayo'] else '否'}")
-        self.log_message(f"Sayo 地址: {self.config['sayo_base_url']}")
-        self.log_message(f"失败后回退 osu!: {'是' if self.config['fallback_to_osu'] else '否'}")
-        self.log_message(f"并行线程数: {self.config['max_workers']}")
-        self.log_message(f"统一使用 API 文件名: {'是' if self.config['use_api_filename'] else '否'}")
-        self.log_message("")
-
-        core = OsuDownloaderCore(
-            config=self.config,
-            log_func=self.log_message_threadsafe,
-            progress_func=self.update_progress_threadsafe,
-            speed_func=self.update_speed_threadsafe,
-            stop_event=self.stop_event,
-        )
-
-        self.worker_thread = threading.Thread(
-            target=self.worker_wrapper,
-            args=(core, user_ids, selected_types, with_video, output_dir, mapper_csv_path),
-            daemon=True,
-        )
-
-        self.worker_thread.start()
-
-    def worker_wrapper(self, core, user_ids, selected_types, with_video, output_dir, mapper_csv_path):
-        try:
-            core.run_download_task(
-                user_ids=user_ids,
-                selected_types=selected_types,
-                with_video=with_video,
-                output_dir=output_dir,
-                mapper_csv_path=mapper_csv_path,
-            )
-        except Exception as e:
-            self.log_message_threadsafe("任务发生错误:")
-            self.log_message_threadsafe(str(e))
-        finally:
-            self.log_message_threadsafe("__TASK_FINISHED__")
-
-    def stop_download(self):
-        if self.worker_thread and self.worker_thread.is_alive():
-            self.stop_event.set()
-            self.log_message("正在请求停止任务，请等待当前下载线程结束...")
-            self.stop_button.config(state=tk.DISABLED)
-
-    def clear_log(self):
-        self.log_text.delete("1.0", tk.END)
-
-    def log_message(self, message):
-        timestamp = time.strftime("%H:%M:%S")
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
-        self.log_text.see(tk.END)
-
-    def log_message_threadsafe(self, message):
-        self.log_queue.put(message)
-
-    def update_progress_threadsafe(self, percent, downloaded, status):
-        self.progress_queue.put((percent, downloaded, status))
-
-    def update_speed_threadsafe(self, speed):
-        self.speed_queue.put(speed)
-
-    @staticmethod
-    def format_speed(speed):
-        if speed <= 0:
-            return "0 KB/s"
-
-        if speed < 1024:
-            return f"{speed:.0f} B/s"
-
-        if speed < 1024 * 1024:
-            return f"{speed / 1024:.2f} KB/s"
-
-        return f"{speed / 1024 / 1024:.2f} MB/s"
-
-    def process_queues(self):
-        try:
-            while True:
-                message = self.log_queue.get_nowait()
-
-                if message == "__TASK_FINISHED__":
-                    self.start_button.config(state=tk.NORMAL)
-                    self.stop_button.config(state=tk.DISABLED)
-                    self.status_label_var.set("任务结束")
-                    self.speed_label_var.set("0 KB/s")
-                else:
-                    self.log_message(message)
-
-        except queue.Empty:
-            pass
-
-        try:
-            while True:
-                percent, downloaded, status = self.progress_queue.get_nowait()
-
-                if percent < 0:
-                    percent = 0
-
-                if percent > 100:
-                    percent = 100
-
-                self.file_progress_var.set(percent)
-                self.file_progress_label_var.set(f"{percent:.1f}%")
-                self.status_label_var.set(status)
-
-        except queue.Empty:
-            pass
-
-        try:
-            while True:
-                speed = self.speed_queue.get_nowait()
-                self.speed_label_var.set(self.format_speed(speed))
-
-        except queue.Empty:
-            pass
-
-        self.root.after(100, self.process_queues)
-
-
-def main():
-    root = tk.Tk()
-    app = OsuDownloaderGUI(root)
-    root.mainloop()
-
-
-if __name__ == "__main__":
-    main()
